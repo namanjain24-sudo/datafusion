@@ -20,7 +20,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::decorrelate::{PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR};
+use crate::decorrelate::{
+    PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR, columns_read_above_aggregate,
+};
 use crate::optimizer::ApplyOrder;
 use crate::utils::{evaluates_to_null, replace_qualified_name};
 use crate::{OptimizerConfig, OptimizerRule};
@@ -351,7 +353,9 @@ fn build_join(
     // join with `Boolean(true)`) when the
     // `enable_physical_uncorrelated_scalar_subquery` option is disabled.
     let subquery_plan = subquery.subquery.as_ref();
-    let mut pull_up = PullUpCorrelatedExpr::new().with_need_handle_count_bug(true);
+    let mut pull_up = PullUpCorrelatedExpr::new()
+        .with_need_handle_count_bug(true)
+        .with_columns_read_above_aggregate(columns_read_above_aggregate(subquery_plan));
     let decorrelated_subquery = subquery_plan.clone().rewrite(&mut pull_up).data()?;
     if !pull_up.can_pull_up {
         return Ok(None);
@@ -445,7 +449,10 @@ mod tests {
     use datafusion_expr::test::function_stub::sum;
 
     use crate::assert_optimized_plan_eq_display_indent_snapshot;
-    use datafusion_expr::{Between, col, expr, out_ref_col, rollup, scalar_subquery};
+    use datafusion_expr::test::function_stub::count;
+    use datafusion_expr::{
+        Between, col, expr, grouping_set, lit, out_ref_col, rollup, scalar_subquery,
+    };
     use datafusion_functions_aggregate::min_max::{max, min};
 
     macro_rules! assert_optimized_plan_equal {
@@ -498,6 +505,61 @@ mod tests {
                   Filter: orders.o_custkey = outer_ref(customer.c_custkey) [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
                     TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
             TableScan: customer [c_custkey:Int64, c_name:Utf8]
+        "
+        )
+    }
+
+    /// A correlated scalar subquery whose two grouping sets each cover only
+    /// one of the two correlated columns (`o_custkey`, correlated to
+    /// `c_custkey`, and `o_orderkey`, correlated to `c_nationkey`) - a scalar
+    /// subquery's `GROUP BY` may only name correlated columns, so this is the
+    /// narrowest shape that can leave one out without also naming an
+    /// unrelated one. The projected scalar is `count(*)`, which reads no
+    /// column, so neither omission is observable and the subquery
+    /// decorrelates, each set still NULL-filling the column it leaves out
+    /// exactly as it did before the pull up.
+    /// <https://github.com/apache/datafusion/issues/25708>
+    #[test]
+    fn scalar_subquery_with_partial_grouping_set_decorrelates_when_column_unread()
+    -> Result<()> {
+        let sq = Arc::new(
+            LogicalPlanBuilder::from(scan_tpch_table("orders"))
+                .filter(
+                    col("orders.o_custkey")
+                        .eq(out_ref_col(DataType::Int64, "customer.c_custkey"))
+                        .and(
+                            col("orders.o_orderkey")
+                                .eq(out_ref_col(DataType::Int64, "customer.c_nationkey")),
+                        ),
+                )?
+                .aggregate(
+                    vec![grouping_set(vec![
+                        vec![col("orders.o_custkey")],
+                        vec![col("orders.o_orderkey")],
+                    ])],
+                    vec![count(lit(1i64))],
+                )?
+                .project(vec![count(lit(1i64))])?
+                .build()?,
+        );
+
+        let plan = LogicalPlanBuilder::from(scan_tpch_table("customer"))
+            .filter(col("customer.c_custkey").eq(scalar_subquery(sq)))?
+            .project(vec![col("customer.c_custkey")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: customer.c_custkey [c_custkey:Int64]
+          Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
+            Filter: customer.c_custkey = __scalar_sq_1.COUNT(Int64(1)) [c_custkey:Int64, c_name:Utf8, COUNT(Int64(1)):Int64;N, o_custkey:Int64;N, o_orderkey:Int64;N]
+              Left Join:  Filter: __scalar_sq_1.o_custkey = customer.c_custkey AND __scalar_sq_1.o_orderkey = customer.c_nationkey [c_custkey:Int64, c_name:Utf8, COUNT(Int64(1)):Int64;N, o_custkey:Int64;N, o_orderkey:Int64;N]
+                TableScan: customer [c_custkey:Int64, c_name:Utf8]
+                SubqueryAlias: __scalar_sq_1 [COUNT(Int64(1)):Int64, o_custkey:Int64;N, o_orderkey:Int64;N]
+                  Projection: COUNT(Int64(1)), orders.o_custkey, orders.o_orderkey [COUNT(Int64(1)):Int64, o_custkey:Int64;N, o_orderkey:Int64;N]
+                    Aggregate: groupBy=[[GROUPING SETS ((orders.o_custkey), (orders.o_orderkey))]], aggr=[[COUNT(Int64(1))]] [o_custkey:Int64;N, o_orderkey:Int64;N, __grouping_id:UInt8, COUNT(Int64(1)):Int64]
+                      TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
         "
         )
     }

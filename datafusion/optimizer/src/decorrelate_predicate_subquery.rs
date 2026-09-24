@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::decorrelate::PullUpCorrelatedExpr;
+use crate::decorrelate::{PullUpCorrelatedExpr, columns_read_above_aggregate};
 use crate::optimizer::ApplyOrder;
 use crate::utils::replace_qualified_name;
 use crate::{OptimizerConfig, OptimizerRule};
@@ -532,7 +532,8 @@ fn build_join(
 ) -> Result<Option<LogicalPlan>> {
     let mut pull_up = PullUpCorrelatedExpr::new()
         .with_in_predicate_opt(in_predicate_opt.cloned())
-        .with_exists_sub_query(in_predicate_opt.is_none());
+        .with_exists_sub_query(in_predicate_opt.is_none())
+        .with_columns_read_above_aggregate(columns_read_above_aggregate(subquery));
 
     let new_plan = subquery.clone().rewrite(&mut pull_up).data()?;
     if !pull_up.can_pull_up {
@@ -900,7 +901,11 @@ mod tests {
         )
     }
 
-    /// A set that groups by another column does not carry the correlated one.
+    /// A set that groups by another column does not carry the correlated one,
+    /// and the subquery's own projection reads that correlated column
+    /// (`correlated_grouping_set_subquery` always selects `c`), so the
+    /// subquery stays correlated: something above the aggregate would see the
+    /// NULL-vs-value difference the pull up would otherwise create.
     /// <https://github.com/apache/datafusion/issues/25519>
     #[test]
     fn exists_subquery_with_partial_grouping_set_is_not_decorrelated() -> Result<()> {
@@ -923,6 +928,87 @@ mod tests {
                 Aggregate: groupBy=[[GROUPING SETS ((sq.c), (sq.b))]], aggr=[[]] [c:UInt32;N, b:UInt32;N, __grouping_id:UInt8]
                   Filter: sq.c = outer_ref(test.c) [a:UInt32, b:UInt32, c:UInt32]
                     TableScan: sq [a:UInt32, b:UInt32, c:UInt32]
+            TableScan: test [a:UInt32, b:UInt32, c:UInt32]
+        "
+        )
+    }
+
+    /// The same partial grouping set, but nothing above the aggregate reads
+    /// the correlated column `c` this time - the subquery's own projection
+    /// reads a literal instead, the same shape `EXISTS` itself always has
+    /// (only row existence is read, never a projected value). Leaving the
+    /// `(b)` set as it is, still NULL-filling `c`, is unobservable here the
+    /// same way it always was before the pull up existed, so the subquery
+    /// decorrelates.
+    /// <https://github.com/apache/datafusion/issues/25708>
+    #[test]
+    fn exists_subquery_with_partial_grouping_set_decorrelates_when_column_unread()
+    -> Result<()> {
+        let subquery = Arc::new(
+            LogicalPlanBuilder::from(test_table_scan_with_name("sq")?)
+                .filter(col("sq.c").eq(out_ref_col(DataType::UInt32, "test.c")))?
+                .aggregate(
+                    vec![grouping_set(vec![vec![col("sq.c")], vec![col("sq.b")]])],
+                    Vec::<Expr>::new(),
+                )?
+                .project(vec![lit(1i64)])?
+                .build()?,
+        );
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .filter(exists(subquery))?
+            .project(vec![col("test.b")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.b [b:UInt32]
+          LeftSemi Join:  Filter: __correlated_sq_1.c = test.c [a:UInt32, b:UInt32, c:UInt32]
+            TableScan: test [a:UInt32, b:UInt32, c:UInt32]
+            SubqueryAlias: __correlated_sq_1 [Int64(1):Int64, c:UInt32;N]
+              Projection: Int64(1), sq.c [Int64(1):Int64, c:UInt32;N]
+                Aggregate: groupBy=[[GROUPING SETS ((sq.c), (sq.b))]], aggr=[[]] [c:UInt32;N, b:UInt32;N, __grouping_id:UInt8]
+                  TableScan: sq [a:UInt32, b:UInt32, c:UInt32]
+        "
+        )
+    }
+
+    /// The same unread-projection shape, but a `HAVING` above the aggregate
+    /// reads the correlated column the `(b)` set leaves out. Leaving that set
+    /// as it is would let the `HAVING` see a value the pull up itself
+    /// introduces in rows it currently NULL-fills, so - unlike the previous
+    /// test - the subquery stays correlated.
+    /// <https://github.com/apache/datafusion/issues/25708>
+    #[test]
+    fn exists_subquery_with_partial_grouping_set_stays_correlated_when_having_reads_column()
+    -> Result<()> {
+        let subquery = Arc::new(
+            LogicalPlanBuilder::from(test_table_scan_with_name("sq")?)
+                .filter(col("sq.c").eq(out_ref_col(DataType::UInt32, "test.c")))?
+                .aggregate(
+                    vec![grouping_set(vec![vec![col("sq.c")], vec![col("sq.b")]])],
+                    Vec::<Expr>::new(),
+                )?
+                .filter(col("sq.c").is_null())?
+                .project(vec![lit(1i64)])?
+                .build()?,
+        );
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .filter(exists(subquery))?
+            .project(vec![col("test.b")])?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.b [b:UInt32]
+          Filter: EXISTS (<subquery>) [a:UInt32, b:UInt32, c:UInt32]
+            Subquery: [Int64(1):Int64]
+              Projection: Int64(1) [Int64(1):Int64]
+                Filter: sq.c IS NULL [c:UInt32;N, b:UInt32;N, __grouping_id:UInt8]
+                  Aggregate: groupBy=[[GROUPING SETS ((sq.c), (sq.b))]], aggr=[[]] [c:UInt32;N, b:UInt32;N, __grouping_id:UInt8]
+                    Filter: sq.c = outer_ref(test.c) [a:UInt32, b:UInt32, c:UInt32]
+                      TableScan: sq [a:UInt32, b:UInt32, c:UInt32]
             TableScan: test [a:UInt32, b:UInt32, c:UInt32]
         "
         )

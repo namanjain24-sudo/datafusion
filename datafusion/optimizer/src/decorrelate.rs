@@ -26,7 +26,8 @@ use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
 };
 use datafusion_common::{
-    Column, DFSchemaRef, HashMap, Result, ScalarValue, assert_or_internal_err, plan_err,
+    Column, DFSchemaRef, HashMap, HashSet, Result, ScalarValue, assert_or_internal_err,
+    plan_err,
 };
 use datafusion_expr::expr::{Alias, GroupingSet};
 use datafusion_expr::simplify::SimplifyContext;
@@ -34,8 +35,8 @@ use datafusion_expr::utils::{
     collect_subquery_cols, conjunction, find_join_exprs, split_conjunction,
 };
 use datafusion_expr::{
-    BinaryExpr, Cast, EmptyRelation, Expr, ExprSchemable, FetchType, LogicalPlan,
-    LogicalPlanBuilder, Operator, expr, lit,
+    Aggregate, BinaryExpr, Cast, EmptyRelation, Expr, ExprSchemable, FetchType,
+    LogicalPlan, LogicalPlanBuilder, Operator, expr, lit,
 };
 
 /// This struct rewrite the sub query plan by pull up the correlated
@@ -74,6 +75,13 @@ pub struct PullUpCorrelatedExpr {
     /// whether we have converted a scalar aggregation into a group aggregation. When unnesting
     /// lateral joins, we need to produce a left outer join in such cases.
     pub pulled_up_scalar_agg: bool,
+    /// Columns some node above the subquery's outermost `Aggregate` reads in
+    /// its own expressions, computed once from the original subquery before
+    /// the rewrite starts (see [`columns_read_above_aggregate`]). Used only
+    /// by [`Self::grouping_sets_cover_pull_up_cols`] to tell whether a
+    /// grouping set may safely leave out a correlated column instead of
+    /// blocking the pull up; see there.
+    pub columns_read_above_aggregate: HashSet<Column>,
 }
 
 impl Default for PullUpCorrelatedExpr {
@@ -95,6 +103,7 @@ impl PullUpCorrelatedExpr {
             collected_count_expr_map: HashMap::new(),
             pull_up_having_expr: None,
             pulled_up_scalar_agg: false,
+            columns_read_above_aggregate: HashSet::new(),
         }
     }
 
@@ -117,6 +126,17 @@ impl PullUpCorrelatedExpr {
         self.exists_sub_query = exists_sub_query;
         self
     }
+
+    /// Set the columns some node above the subquery's outermost `Aggregate`
+    /// reads. See [`Self::columns_read_above_aggregate`] and
+    /// [`columns_read_above_aggregate`] (the free function that computes it).
+    pub fn with_columns_read_above_aggregate(
+        mut self,
+        columns_read_above_aggregate: HashSet<Column>,
+    ) -> Self {
+        self.columns_read_above_aggregate = columns_read_above_aggregate;
+        self
+    }
 }
 
 /// Used to indicate the unmatched rows from the inner(subquery) table after the left out Join
@@ -124,6 +144,44 @@ impl PullUpCorrelatedExpr {
 ///
 /// [the Count bug]: https://github.com/apache/datafusion/issues/10553
 pub const UN_MATCHED_ROW_INDICATOR: &str = "__always_true";
+
+/// Columns any node reads in its own expressions, stopping at (and not
+/// including) the first `Aggregate` found on each branch of `plan`.
+///
+/// `GROUPING`/`GROUPING_ID` calls are already lowered to a reference to the
+/// [`Aggregate::INTERNAL_GROUPING_ID`] column by the `ResolveGroupingFunction`
+/// analyzer rule, which runs before any optimizer rule does, so tracking
+/// plain column references here also catches those - no separate check for
+/// the two functions is needed.
+///
+/// Meant to be computed once, from the original subquery, before
+/// [`PullUpCorrelatedExpr`] starts rewriting it: rewriting can remove or
+/// change the nodes below an `Aggregate` (the correlated filter that
+/// motivated the pull up in the first place is usually one of them), which
+/// would make a node found here fail to match the corresponding node in the
+/// plan being rewritten. Nothing below an `Aggregate` is "above" it anyway,
+/// so this restriction costs nothing.
+///
+/// See [`PullUpCorrelatedExpr::grouping_sets_cover_pull_up_cols`] for why
+/// this matters: a grouping set that leaves out a correlated column is safe
+/// to leave as it is only when nothing above the aggregate reads that
+/// column's value.
+pub(crate) fn columns_read_above_aggregate(plan: &LogicalPlan) -> HashSet<Column> {
+    let mut columns = HashSet::new();
+    fn walk(plan: &LogicalPlan, columns: &mut HashSet<Column>) {
+        if matches!(plan, LogicalPlan::Aggregate(_)) {
+            return;
+        }
+        for expr in plan.expressions() {
+            columns.extend(expr.column_refs().into_iter().cloned());
+        }
+        for child in plan.inputs() {
+            walk(child, columns);
+        }
+    }
+    walk(plan, &mut columns);
+    columns
+}
 
 /// Mapping from expr display name to its evaluation result on empty record
 /// batch (for example: 'count(*)' is 'ScalarValue(0)', 'count(*) + 2' is
@@ -445,20 +503,33 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
 
 impl PullUpCorrelatedExpr {
     /// Whether the pull up can add its columns to `group_expr` without changing
-    /// what the aggregate returns.
+    /// what the aggregate returns, or without anything above it observing a
+    /// difference if it doesn't.
     ///
     /// `true` when `group_expr` holds no grouping set, and when every set of every
-    /// grouping set it holds already groups by each column
-    /// [`Self::collect_missing_exprs`] would add. In the second case the pull up
-    /// adds nothing and the aggregate keeps the sets it has.
+    /// grouping set it holds either already groups by each column
+    /// [`Self::collect_missing_exprs`] would add, or is a non-empty set that
+    /// leaves one out and nothing above the aggregate reads that column (see
+    /// below). In both cases the pull up adds nothing and the aggregate keeps
+    /// the sets it has: in the first because there is nothing to add, in the
+    /// second because leaving the column NULL-filled in that set, same as
+    /// before the pull up, cannot be observed.
     ///
     /// `ROLLUP` and `CUBE` always contain the empty set, which yields a row for
     /// outer rows the correlated filter matches nothing for, so they are only safe
-    /// when there is nothing to add.
+    /// when there is nothing to add. An explicit `GROUPING SETS` that lists the
+    /// empty set is rejected for the same reason, regardless of whether anything
+    /// reads the missing columns: no join can produce that row either way.
     ///
     /// A non-empty set that leaves a column out fills it with NULL. Adding the
-    /// column would give it a value instead, which a `HAVING` or a projection
-    /// above the aggregate can read, so such a set is rejected as well.
+    /// column would give it a value instead of NULL in exactly those rows, a
+    /// difference that a `HAVING`, a projection above the aggregate, or a
+    /// `GROUPING`/`GROUPING_ID` call can observe - the last of these because it
+    /// changes which sets are represented in the pulled-up result. When nothing
+    /// above the aggregate reads that column (`self.columns_read_above_aggregate`,
+    /// computed once before the rewrite starts - see
+    /// [`columns_read_above_aggregate`]), the NULL-vs-value difference is exactly
+    /// as unobservable there as it is here, so such a set is safe to leave alone.
     fn grouping_sets_cover_pull_up_cols(
         &self,
         group_expr: &[Expr],
@@ -491,12 +562,24 @@ impl PullUpCorrelatedExpr {
             return true;
         }
 
+        // `GROUPING`/`GROUPING_ID` is already a reference to this column by
+        // the time the optimizer runs; see `columns_read_above_aggregate`.
+        let grouping_id_read_above = self
+            .columns_read_above_aggregate
+            .iter()
+            .any(|col| col.name == Aggregate::INTERNAL_GROUPING_ID);
+
         grouping_sets.iter().all(|grouping_set| match grouping_set {
             GroupingSet::Rollup(_) | GroupingSet::Cube(_) => false,
             GroupingSet::GroupingSets(sets) => sets.iter().all(|set| {
+                if set.is_empty() {
+                    return false;
+                }
                 required_cols.iter().all(|col| {
                     set.iter()
                         .any(|expr| matches!(expr, Expr::Column(c) if c == *col))
+                        || (!grouping_id_read_above
+                            && !self.columns_read_above_aggregate.contains(*col))
                 })
             }),
         })
